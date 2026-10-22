@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>声で答える｜Meライト＋</title>
+<style>
+  :root {
+    --bg: #FBF7F2;
+    --card: #FFFFFF;
+    --ink: #3D2E26;
+    --sub: #7A685C;
+    --line: #E9DED3;
+    --accent: #A0674B;
+    --accent-soft: #F6EFE7;
+    --ok: #3F7D4E;
+    --ok-soft: #E3F1E3;
+    --todo: #B5483A;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif;
+    font-size: 16px; line-height: 1.7; -webkit-text-size-adjust: 100%;
+  }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 20px 16px 40px; }
+  .eyebrow { color: var(--accent); font-weight: 700; font-size: 13px; letter-spacing: .04em; }
+  h1 { font-size: 22px; line-height: 1.4; margin: 2px 0 10px; }
+  .intro { color: var(--sub); font-size: 14px; margin: 0 0 18px; }
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px 0 8px; }
+  .mic {
+    width: 132px; height: 132px; border-radius: 50%; border: none; cursor: pointer;
+    background: var(--accent); color: #fff; font: inherit; font-weight: 700; font-size: 16px;
+    box-shadow: 0 6px 18px rgba(160, 103, 75, .28); position: relative;
+  }
+  .mic[disabled] { opacity: .55; cursor: default; }
+  .mic.live::after {
+    content: ''; position: absolute; inset: -10px; border-radius: 50%;
+    border: 3px solid var(--accent); opacity: .5; animation: pulse 1.6s ease-out infinite;
+  }
+  .mic.speaking::after { border-color: var(--ok); }
+  @keyframes pulse { from { transform: scale(.92); opacity: .6; } to { transform: scale(1.12); opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .mic.live::after { animation: none; } }
+  .status { font-size: 14px; color: var(--sub); min-height: 1.7em; text-align: center; }
+  .end { border: 1px solid var(--line); background: #fff; color: var(--ink); border-radius: 999px; padding: 8px 18px; font: inherit; font-size: 14px; cursor: pointer; }
+  .log { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin-top: 16px; max-height: 46vh; overflow-y: auto; }
+  .log:empty { display: none; }
+  .msg { margin-bottom: 10px; font-size: 15px; }
+  .msg:last-child { margin-bottom: 0; }
+  .msg .who { font-size: 12px; font-weight: 700; color: var(--accent); }
+  .msg.me .who { color: var(--sub); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-top: 16px; }
+  .ans { margin-bottom: 12px; }
+  .ans .q { font-size: 13px; color: var(--sub); font-weight: 600; }
+  .ans .v { white-space: pre-wrap; }
+  .btn { display: block; text-align: center; text-decoration: none; background: var(--accent); color: #fff; border-radius: 12px; padding: 13px; font-weight: 700; margin-top: 14px; }
+  .btn.secondary { background: #fff; color: var(--accent); border: 1px solid var(--accent); }
+  .note { font-size: 14px; color: var(--sub); background: var(--accent-soft); border-radius: 10px; padding: 10px 12px; margin-top: 14px; }
+  .error { color: var(--todo); }
+  details { margin-top: 18px; font-size: 12px; color: var(--sub); }
+  details pre { white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<script id="inject" type="application/json"><?!= injectJson ?></script>
+<div class="wrap">
+  <div class="eyebrow" id="eyebrow">Meライト＋</div>
+  <h1 id="title">声で答える</h1>
+  <p class="intro">ボタンを押すと、AIが声で質問するよ。思ったまま話してね。5分くらいで終わるよ。<br>静かな場所で、イヤホンを使うと聞き取りやすいよ。</p>
+
+  <div class="stage">
+    <button type="button" class="mic" id="mic">話しはじめる</button>
+    <div class="status" id="status" role="status" aria-live="polite"></div>
+    <button type="button" class="end" id="end" hidden>会話を終える</button>
+  </div>
+
+  <div class="log" id="log" aria-live="polite"></div>
+  <div id="result"></div>
+
+  <details>
+    <summary>うまくいかないとき（運営に送る情報）</summary>
+    <pre id="debug"></pre>
+  </details>
+</div>
+
+<script>
+// 声の画面をApps Scriptの外（GitHub Pagesなど）に置くときは、ここにウェブアプリのURL（…/exec）を入れてもいい。
+// LINEのボタンから開くと、URLの api= から自動で入るので、ふつうは空でいい。
+var API_URL = '';
+
+var CFG = (function () {
+  var inj = {};
+  try { inj = JSON.parse(document.getElementById('inject').textContent); } catch (e) { inj = {}; }
+  var q = new URLSearchParams(location.search);
+  return {
+    api: inj.api || q.get('api') || API_URL,
+    key: inj.key || q.get('k') || '',
+    n: Number(inj.n || q.get('n') || 0),
+    standalone: !inj.api
+  };
+})();
+
+var el = {
+  mic: document.getElementById('mic'), status: document.getElementById('status'), end: document.getElementById('end'),
+  log: document.getElementById('log'), result: document.getElementById('result'), debug: document.getElementById('debug'),
+  title: document.getElementById('title'), eyebrow: document.getElementById('eyebrow')
+};
+
+var S = {
+  info: null, ws: null, ctx: null, stream: null, proc: null, source: null,
+  attempt: 0, ready: false, ended: false, saved: false, savedAnswers: null,
+  playHead: 0, sources: [], lines: [], current: { ai: null, me: null }
+};
+
+function debug(msg) {
+  var t = new Date().toLocaleTimeString('ja-JP');
+  el.debug.textContent += '[' + t + '] ' + msg + '\n';
+}
+function setStatus(text, isError) {
+  el.status.textContent = text;
+  el.status.classList.toggle('error', !!isError);
+}
+
+// ───────── 運営のスクリプトとのやりとり
+
+function apiGet(params) {
+  var u = CFG.api + '?' + new URLSearchParams(params).toString();
+  return fetch(u).then(function (r) { return r.json(); });
+}
+function apiPost(body) {
+  return fetch(CFG.api, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json(); });
+}
+
+// ───────── 会話の表示と記録
+
+function addText(who, text) {
+  if (!text) return;
+  var key = who === 'AI' ? 'ai' : 'me';
+  var other = key === 'ai' ? 'me' : 'ai';
+  S.current[other] = null; // 話す人が変わったら、次は新しい吹き出し
+  if (!S.current[key]) {
+    var line = { who: who, text: '' };
+    S.lines.push(line);
+    var node = document.createElement('div');
+    node.className = 'msg' + (key === 'me' ? ' me' : '');
+    node.innerHTML = '<div class="who"></div><div class="t"></div>';
+    node.querySelector('.who').textContent = who === 'AI' ? 'AI' : 'あなた';
+    el.log.appendChild(node);
+    S.current[key] = { line: line, node: node.querySelector('.t') };
+  }
+  S.current[key].line.text += text;
+  S.current[key].node.textContent = S.current[key].line.text;
+  el.log.scrollTop = el.log.scrollHeight;
+}
+function transcript() {
+  return S.lines.map(function (l) { return (l.who === 'AI' ? 'AI' : 'あなた') + '：' + l.text.trim(); }).join('\n');
+}
+
+// ───────── 音声（マイク → 16kHz PCM、Geminiの声 24kHz PCM → スピーカー）
+
+function toBase64(bytes) {
+  var bin = '';
+  for (var i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function downsampleTo16k(input, rate) {
+  var ratio = rate / 16000, len = Math.floor(input.length / ratio), out = new Int16Array(len);
+  for (var i = 0; i < len; i++) {
+    var start = Math.floor(i * ratio), end = Math.min(input.length, Math.floor((i + 1) * ratio)), sum = 0;
+    for (var j = start; j < end; j++) sum += input[j];
+    var s = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  return out;
+}
+function startMic() {
+  S.source = S.ctx.createMediaStreamSource(S.stream);
+  S.proc = S.ctx.createScriptProcessor(4096, 1, 1);
+  var mute = S.ctx.createGain();
+  mute.gain.value = 0;
+  S.proc.onaudioprocess = function (e) {
+    if (!S.ready || !S.ws || S.ws.readyState !== 1) return;
+    var pcm = downsampleTo16k(e.inputBuffer.getChannelData(0), S.ctx.sampleRate);
+    send({ realtimeInput: { audio: { data: toBase64(new Uint8Array(pcm.buffer)), mimeType: 'audio/pcm;rate=16000' } } });
+  };
+  S.source.connect(S.proc);
+  S.proc.connect(mute);
+  mute.connect(S.ctx.destination);
+}
+function playPcm(b64) {
+  var bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  var pcm = new Int16Array(bytes.buffer, 0, Math.floor(bytes.length / 2));
+  if (!pcm.length) return;
+  var buf = S.ctx.createBuffer(1, pcm.length, 24000), ch = buf.getChannelData(0);
+  for (var k = 0; k < pcm.length; k++) ch[k] = pcm[k] / 0x8000;
+  var src = S.ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(S.ctx.destination);
+  var at = Math.max(S.ctx.currentTime + 0.03, S.playHead);
+  src.start(at);
+  S.playHead = at + buf.duration;
+  S.sources.push(src);
+  src.onended = function () {
+    S.sources = S.sources.filter(function (x) { return x !== src; });
+    if (!S.sources.length) el.mic.classList.remove('speaking');
+  };
+  el.mic.classList.add('speaking');
+}
+function stopPlayback() {
+  S.sources.forEach(function (s) { try { s.stop(); } catch (e) {} });
+  S.sources = [];
+  S.playHead = 0;
+  el.mic.classList.remove('speaking');
+}
+
+// ───────── Geminiとつなぐ
+
+function send(obj) {
+  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(obj));
+}
+
+/** 最初に送る設定。Googleの説明で書き方が分かれているので、つながるまで順に試す */
+function setupVariants(info) {
+  var c = info.config, full = { model: info.model, systemInstruction: c.systemInstruction, tools: c.tools,
+    inputAudioTranscription: {}, outputAudioTranscription: {} };
+  var gen = { responseModalities: ['AUDIO'] };
+  if (c.speechConfig) gen.speechConfig = c.speechConfig;
+  var a = Object.assign({}, full, { generationConfig: gen });
+  var b = Object.assign({}, full, { responseModalities: ['AUDIO'] });
+  if (c.speechConfig) b.speechConfig = c.speechConfig;
+  var list = [{ setup: a }, { setup: b }];
+  if (info.locked) list.unshift({ setup: { model: info.model } });
+  return list;
+}
+
+function connect() {
+  var variants = setupVariants(S.info);
+  var variant = variants[Math.min(S.attempt, variants.length - 1)];
+  debug('接続 ' + (S.attempt + 1) + '回目（' + Object.keys(variant.setup).join(',') + '）');
+  var ws = new WebSocket(S.info.wsUrl + '?access_token=' + encodeURIComponent(S.info.token));
+  S.ws = ws;
+  ws.onopen = function () { send(variant); };
+  ws.onmessage = function (ev) {
+    var data = ev.data;
+    (typeof data === 'string' ? Promise.resolve(data) : data.text()).then(function (text) {
+      var msg;
+      try { msg = JSON.parse(text); } catch (e) { debug('読めない返事: ' + text.slice(0, 120)); return; }
+      handleMessage(msg);
+    });
+  };
+  ws.onerror = function () { debug('WebSocketエラー'); };
+  ws.onclose = function (ev) {
+    debug('切断 code=' + ev.code + ' ' + (ev.reason || ''));
+    if (S.ended) return;
+    if (!S.ready && S.attempt < variants.length - 1) {
+      S.attempt++;
+      setStatus('つなぎ直しています…');
+      // 鍵は1回しか使えないので、新しい鍵をもらってからつなぎ直す
+      loadInfo().then(function (info) { if (info) connect(); });
+      return;
+    }
+    finish(S.ready ? '' : 'Geminiにつながらなかったよ。');
+  };
+}
+
+function handleMessage(msg) {
+  if (msg.setupComplete) {
+    S.ready = true;
+    debug('つながりました');
+    setStatus('聞いてるよ。AIの質問に答えてね');
+    el.mic.textContent = '会話中';
+    el.mic.classList.add('live');
+    el.end.hidden = false;
+    send({ clientContent: { turns: [{ role: 'user', parts: [{ text: 'はじめる' }] }], turnComplete: true } });
+    return;
+  }
+  var sc = msg.serverContent;
+  if (sc) {
+    if (sc.interrupted) stopPlayback();
+    if (sc.modelTurn && sc.modelTurn.parts) {
+      sc.modelTurn.parts.forEach(function (p) { if (p.inlineData && p.inlineData.data) playPcm(p.inlineData.data); });
+    }
+    if (sc.outputTranscription && sc.outputTranscription.text) addText('AI', sc.outputTranscription.text);
+    if (sc.inputTranscription && sc.inputTranscription.text) addText('me', sc.inputTranscription.text);
+    if (sc.turnComplete && S.saved) finishAfterPlayback(); // 保存のあとのあいさつが終わったら閉じる
+  }
+  if (msg.toolCall && msg.toolCall.functionCalls) {
+    msg.toolCall.functionCalls.forEach(function (fc) {
+      if (fc.name !== 'save_answers') {
+        send({ toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response: { result: 'この道具はありません' } }] } });
+        return;
+      }
+      debug('答えの保存を受け取りました');
+      setStatus('答えを保存しています…');
+      apiPost({ action: 'voiceSave', k: CFG.key, n: CFG.n, answers: fc.args || {}, transcript: transcript() })
+        .then(function (res) {
+          S.saved = !!res.saved;
+          S.savedAnswers = fc.args || {};
+          send({ toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response: { result: res.saved ? '保存しました' : '保存できませんでした：' + res.message } }] } });
+          setStatus(res.saved ? '保存できたよ。AIのあいさつが終わったら、下から確認してね' : res.message, !res.saved);
+          showResult(res);
+        })
+        .catch(function (err) {
+          debug('保存エラー ' + err);
+          send({ toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response: { result: '保存できませんでした' } }] } });
+          setStatus('保存できなかったよ。もう一度試してね', true);
+        });
+    });
+  }
+  if (msg.goAway) debug('まもなく切れます ' + JSON.stringify(msg.goAway));
+}
+
+function loadInfo() {
+  return apiGet({ p: 'vcfg', k: CFG.key, n: CFG.n }).then(function (info) {
+    if (!info.ok) {
+      setStatus(info.message, true);
+      if (info.workUrl) el.result.innerHTML = '<a class="btn secondary" href="' + info.workUrl + '">ワーク画面を開く</a>';
+      el.mic.disabled = true;
+      return null;
+    }
+    S.info = info;
+    el.title.textContent = info.title;
+    return info;
+  }).catch(function (err) {
+    debug('設定の取得に失敗 ' + err);
+    setStatus('通信できなかったよ。電波のいいところでもう一度試してね', true);
+    el.mic.disabled = false;
+    return null;
+  });
+}
+
+function start() {
+  el.mic.disabled = true;
+  setStatus('準備しています…');
+  var Ctx = window.AudioContext || window.webkitAudioContext;
+  S.ctx = new Ctx();
+  S.ctx.resume();
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return micBlocked('この画面ではマイクが使えないみたい。');
+  navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+    .then(function (stream) {
+      S.stream = stream;
+      startMic();
+      return loadInfo();
+    })
+    .then(function (info) { if (info) { setStatus('つないでいます…'); connect(); } })
+    .catch(function (err) {
+      debug('マイク: ' + err.name + ' ' + err.message);
+      micBlocked(err.name === 'NotAllowedError' ? 'マイクの使用が許可されなかったよ。' : 'マイクを使えなかったよ。');
+    });
+}
+
+function micBlocked(reason) {
+  setStatus(reason, true);
+  el.mic.disabled = false;
+  var html = '<div class="note">マイクの許可を求められたら「許可」を押してね。';
+  if (CFG.standalone && /Line\//i.test(navigator.userAgent)) {
+    var u = new URL(location.href);
+    u.searchParams.set('openExternalBrowser', '1');
+    html += '<br>LINEの中の画面だとマイクが使えないことがあるよ。下のボタンからブラウザで開いてね。</div><a class="btn" href="' + u.toString() + '">ブラウザで開く</a>';
+  } else {
+    html += '<br>それでもだめなときは、文字のワークで答えてね。</div>';
+  }
+  el.result.innerHTML = html;
+}
+
+function finish(message) {
+  if (S.ended) return;
+  S.ended = true;
+  el.end.hidden = true;
+  el.mic.classList.remove('live');
+  el.mic.textContent = '終わり';
+  el.mic.disabled = true;
+  try { if (S.proc) S.proc.disconnect(); } catch (e) {}
+  try { if (S.stream) S.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+  try { if (S.ws && S.ws.readyState <= 1) { send({ realtimeInput: { audioStreamEnd: true } }); S.ws.close(); } } catch (e) {}
+  if (S.saved) return;
+  if (message) setStatus(message, true);
+  if (!S.lines.length) return;
+  // 答えを保存する前に終わったときも、会話の記録は運営に届ける
+  apiPost({ action: 'voiceSave', k: CFG.key, n: CFG.n, transcript: transcript() }).then(function (res) {
+    setStatus('途中で終わったので、会話の記録だけ保存したよ。');
+    el.result.innerHTML = '<div class="note">続きは、もう一度「声で答える」を開くか、文字のワークで答えてね。</div>' +
+      (res.workUrl ? '<a class="btn secondary" href="' + res.workUrl + '">文字のワークを開く</a>' : '');
+  }).catch(function () {});
+}
+
+function finishAfterPlayback() {
+  var wait = Math.max(0, (S.playHead - S.ctx.currentTime) * 1000) + 800;
+  setTimeout(function () { finish(''); setStatus('おつかれさま！下から答えを確認してね'); }, wait);
+}
+
+function showResult(res) {
+  if (!res.saved) return;
+  var labels = (S.info && S.info.labels) || [];
+  var box = document.createElement('div');
+  box.className = 'card';
+  box.innerHTML = '<div class="eyebrow">下書きに入れた答え</div>';
+  labels.forEach(function (l) {
+    var v = S.savedAnswers[l.id];
+    if (v === undefined || v === '' || (Array.isArray(v) && !v.length)) return;
+    var row = document.createElement('div');
+    row.className = 'ans';
+    row.innerHTML = '<div class="q"></div><div class="v"></div>';
+    row.querySelector('.q').textContent = l.label;
+    row.querySelector('.v').textContent = Array.isArray(v) ? v.join('、') : String(v);
+    box.appendChild(row);
+  });
+  var a = document.createElement('a');
+  a.className = 'btn';
+  a.href = res.workUrl;
+  a.textContent = 'ワーク画面で確認して提出する';
+  box.appendChild(a);
+  el.result.innerHTML = '';
+  el.result.appendChild(box);
+}
+
+el.mic.addEventListener('click', start);
+el.end.addEventListener('click', function () { finish(''); });
+
+if (!CFG.api || !CFG.key || !CFG.n) {
+  setStatus('このページは開けませんでした。LINEのメッセージのボタンから開き直してね。', true);
+  el.mic.disabled = true;
+} else {
+  el.eyebrow.textContent = 'Meライト＋｜第' + CFG.n + '回';
+}
+</script>
+</body>
+</html>
