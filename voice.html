@@ -109,7 +109,7 @@ var el = {
 
 var S = {
   info: null, ws: null, ctx: null, stream: null, proc: null, source: null,
-  attempt: 0, ready: false, ended: false, saved: false, savedAnswers: null,
+  attempt: 0, ready: false, ended: false, saved: false, savedAnswers: null, stopping: false, partialSaved: false,
   playHead: 0, sources: [], lines: [], current: { ai: null, me: null }
 };
 
@@ -270,7 +270,7 @@ function handleMessage(msg) {
   if (msg.setupComplete) {
     S.ready = true;
     debug('つながりました');
-    setStatus('聞いてるよ。AIの質問に答えてね');
+    setStatus(S.info.resume ? '聞いてるよ。前回の続きからだよ' : '聞いてるよ。AIの質問に答えてね');
     el.mic.textContent = '会話中';
     el.mic.classList.add('live');
     el.end.hidden = false;
@@ -285,7 +285,7 @@ function handleMessage(msg) {
     }
     if (sc.outputTranscription && sc.outputTranscription.text) addText('AI', sc.outputTranscription.text);
     if (sc.inputTranscription && sc.inputTranscription.text) addText('me', sc.inputTranscription.text);
-    if (sc.turnComplete && S.saved) finishAfterPlayback(); // 保存のあとのあいさつが終わったら閉じる
+    if (sc.turnComplete && (S.saved || S.partialSaved)) finishAfterPlayback(); // 保存のあとのあいさつが終わったら閉じる
   }
   if (msg.toolCall && msg.toolCall.functionCalls) {
     msg.toolCall.functionCalls.forEach(function (fc) {
@@ -295,11 +295,13 @@ function handleMessage(msg) {
       }
       debug('答えの保存を受け取りました');
       setStatus('答えを保存しています…');
-      apiPost({ action: 'voiceSave', k: CFG.key, n: CFG.n, answers: fc.args || {}, transcript: transcript() })
+      var partial = S.stopping;
+      apiPost({ action: 'voiceSave', k: CFG.key, n: CFG.n, answers: fc.args || {}, transcript: transcript(), partial: partial })
         .then(function (res) {
-          S.saved = !!res.saved;
+          if (partial) S.partialSaved = !!res.saved; else S.saved = !!res.saved;
           S.savedAnswers = fc.args || {};
           send({ toolResponse: { functionResponses: [{ id: fc.id, name: fc.name, response: { result: res.saved ? '保存しました' : '保存できませんでした：' + res.message } }] } });
+          if (partial) { setTimeout(function () { finish(''); }, 4000); return; }
           setStatus(res.saved ? '保存できたよ。AIのあいさつが終わったら、下から確認してね' : res.message, !res.saved);
           showResult(res);
         })
@@ -333,10 +335,11 @@ function loadInfo() {
 }
 
 function start() {
+  if (S.ended) resetForRestart();
   el.mic.disabled = true;
   setStatus('準備しています…');
   var Ctx = window.AudioContext || window.webkitAudioContext;
-  S.ctx = new Ctx();
+  if (!S.ctx) S.ctx = new Ctx();
   S.ctx.resume();
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return micBlocked('この画面ではマイクが使えないみたい。');
   navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
@@ -366,30 +369,67 @@ function micBlocked(reason) {
   el.result.innerHTML = html;
 }
 
+/** 「会話を終える」：最後まで終わっていなければ、ここまでの答えをAIに保存してもらってから閉じる */
+function requestStop() {
+  if (!S.ready || S.saved || S.stopping || S.ended) return finish('');
+  S.stopping = true;
+  el.end.hidden = true;
+  setStatus('ここまでの答えを保存しています…');
+  send({ clientContent: { turns: [{ role: 'user', parts: [{ text: '（受講生が途中で終えます。ここまでに答えが出た質問だけを save_answers で保存して、「続きはまた今度ね」とだけ言って終わって）' }] }], turnComplete: true } });
+  setTimeout(function () { finish(''); }, 15000); // AIが保存しなかったときの保険
+}
+
 function finish(message) {
   if (S.ended) return;
   S.ended = true;
   el.end.hidden = true;
   el.mic.classList.remove('live');
-  el.mic.textContent = '終わり';
-  el.mic.disabled = true;
-  try { if (S.proc) S.proc.disconnect(); } catch (e) {}
+  stopPlayback();
+  try { if (S.proc) { S.proc.onaudioprocess = null; S.proc.disconnect(); } } catch (e) {}
+  try { if (S.source) S.source.disconnect(); } catch (e) {}
   try { if (S.stream) S.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
   try { if (S.ws && S.ws.readyState <= 1) { send({ realtimeInput: { audioStreamEnd: true } }); S.ws.close(); } } catch (e) {}
-  if (S.saved) return;
+  if (S.saved) {
+    el.mic.textContent = '終わり';
+    el.mic.disabled = true;
+    return;
+  }
+  // 最後まで終わっていないので、同じ画面から続きを始められるようにする
+  el.mic.textContent = '続きから話す';
+  el.mic.disabled = false;
+  var again = '<div class="note">「続きから話す」を押すと、答えたところの続きから聞くよ。あとで開き直しても続きからになるよ。</div>';
+  if (S.partialSaved) {
+    setStatus('ここまでの答えを下書きに保存したよ。');
+    el.result.innerHTML = again;
+    return;
+  }
   if (message) setStatus(message, true);
   if (!S.lines.length) return;
-  // 答えを保存する前に終わったときも、会話の記録は運営に届ける
+  // AIが答えを保存する前に終わったときも、会話の記録は運営に届ける（続きから聞くときにも使う）
   apiPost({ action: 'voiceSave', k: CFG.key, n: CFG.n, transcript: transcript() }).then(function (res) {
-    setStatus('途中で終わったので、会話の記録だけ保存したよ。');
-    el.result.innerHTML = '<div class="note">続きは、もう一度「声で答える」を開くか、文字のワークで答えてね。</div>' +
-      (res.workUrl ? '<a class="btn secondary" href="' + res.workUrl + '">文字のワークを開く</a>' : '');
+    setStatus(message || 'ここまでの会話を保存したよ。');
+    el.result.innerHTML = again + (res.workUrl ? '<a class="btn secondary" href="' + res.workUrl + '">文字のワークで答える</a>' : '');
   }).catch(function () {});
+}
+
+function resetForRestart() {
+  S.ended = false; S.ready = false; S.attempt = 0; S.stopping = false; S.partialSaved = false;
+  S.lines = []; S.current = { ai: null, me: null }; S.playHead = 0; S.ws = null;
+  el.result.innerHTML = '';
+  if (el.log.childNodes.length) {
+    var hr = document.createElement('div');
+    hr.className = 'msg me';
+    hr.textContent = '― ここから続き ―';
+    el.log.appendChild(hr);
+  }
 }
 
 function finishAfterPlayback() {
   var wait = Math.max(0, (S.playHead - S.ctx.currentTime) * 1000) + 800;
-  setTimeout(function () { finish(''); setStatus('おつかれさま！下から答えを確認してね'); }, wait);
+  setTimeout(function () {
+    finish('');
+    if (S.saved) setStatus('おつかれさま！下から答えを確認してね');
+  }, wait);
 }
 
 function showResult(res) {
@@ -418,7 +458,7 @@ function showResult(res) {
 }
 
 el.mic.addEventListener('click', start);
-el.end.addEventListener('click', function () { finish(''); });
+el.end.addEventListener('click', requestStop);
 
 if (!CFG.api || !CFG.key || !CFG.n) {
   setStatus('このページは開けませんでした。LINEのメッセージのボタンから開き直してね。', true);
